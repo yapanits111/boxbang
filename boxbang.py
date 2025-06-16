@@ -1,11 +1,7 @@
 import pygame
 import sys
-import math
-import random
-from datetime import datetime, timedelta
 import os
-import time
-import copy
+from collections import deque
 
 # Initialize pygame
 pygame.init()
@@ -22,20 +18,16 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 GRAY = (150, 150, 150)
 DARK_GRAY = (100, 100, 100)
-RED = (255, 0, 0)
 GREEN = (0, 255, 0)
 BLUE = (0, 0, 255)
 YELLOW = (255, 255, 0)
 ORANGE = (255, 165, 0)
-PURPLE = (128, 0, 128)
 
 # Game elements
 WALL = '#'
 PLAYER = '@'
 CRATE = '$'
 TARGET = '.'
-CRATE_ON_TARGET = '*'
-PLAYER_ON_TARGET = '+'
 FLOOR = ' '
 
 # Create the screen
@@ -55,7 +47,6 @@ class GameState:
         self.crates_pos = [crate[:] for crate in crates_pos]
         self.targets_pos = targets_pos[:]
         self.move_count = move_count
-        self.moves_history = []
     
     def copy(self):
         return GameState(
@@ -66,67 +57,14 @@ class GameState:
             self.move_count
         )
     
-    def evaluate(self):
-        """Evaluation function for simulated annealing - prioritizes fewer moves"""
-        if self.is_solved():
-            # Solved state - return negative move count to prefer fewer moves
-            return -self.move_count
-        
-        total_distance = 0
-        
-        # Calculate minimum total distance from crates to targets
-        for crate in self.crates_pos:
-            min_dist = float('inf')
-            for target in self.targets_pos:
-                dist = abs(crate[0] - target[0]) + abs(crate[1] - target[1])
-                min_dist = min(min_dist, dist)
-            total_distance += min_dist
-        
-        # Add penalty for deadlocks
-        deadlock_penalty = 0
-        for crate in self.crates_pos:
-            if self._is_deadlock(crate):
-                deadlock_penalty += 1000  # Heavy penalty for deadlocks
-        
-        # Add penalty for crates blocking each other
-        blocking_penalty = 0
-        for i, crate1 in enumerate(self.crates_pos):
-            for j, crate2 in enumerate(self.crates_pos[i+1:], i+1):
-                if abs(crate1[0] - crate2[0]) + abs(crate1[1] - crate2[1]) == 1:
-                    blocking_penalty += 10
-        
-        # Penalty for too many moves (encourages shorter solutions)
-        move_penalty = self.move_count * 2
-        
-        return total_distance + deadlock_penalty + blocking_penalty + move_penalty
-
-    def _is_deadlock(self, crate):
-        """Check if a crate is in a deadlock position"""
-        x, y = crate
-        
-        # If on target, not deadlocked
-        if [x, y] in self.targets_pos:
-            return False
-        
-        # Check for corner deadlock
-        left_blocked = x == 0 or self.grid[y][x-1] == WALL
-        right_blocked = x == len(self.grid[0])-1 or self.grid[y][x+1] == WALL
-        top_blocked = y == 0 or self.grid[y-1][x] == WALL
-        bottom_blocked = y == len(self.grid)-1 or self.grid[y+1][x] == WALL
-        
-        # Corner deadlock
-        if (left_blocked or right_blocked) and (top_blocked or bottom_blocked):
-            return True
-        
-        return False
-    
     def is_solved(self):
         """Check if all crates are on targets"""
-        crates_on_targets = 0
-        for crate in self.crates_pos:
-            if crate in self.targets_pos:
-                crates_on_targets += 1
-        return crates_on_targets == len(self.targets_pos)
+        return len(self.crates_pos) == len(self.targets_pos) and all(crate in self.targets_pos for crate in self.crates_pos)
+    
+    def get_hash(self):
+        """Get a hash of the current state for duplicate detection"""
+        crates_tuple = tuple(tuple(crate) for crate in sorted(self.crates_pos))
+        return (tuple(self.player_pos), crates_tuple)
     
     def get_possible_moves(self):
         """Get all possible moves from current state"""
@@ -134,50 +72,48 @@ class GameState:
         directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # up, right, down, left
         
         for dx, dy in directions:
-            new_x, new_y = self.player_pos[0] + dx, self.player_pos[1] + dy
-            
-            # Check bounds
-            if (new_y < 0 or new_y >= len(self.grid) or 
-                new_x < 0 or new_x >= len(self.grid[0])):
-                continue
-            
-            # Check wall
-            if self.grid[new_y][new_x] == WALL:
-                continue
-            
-            # Check if there's a crate
-            crate_at_pos = None
-            for crate in self.crates_pos:
-                if crate[0] == new_x and crate[1] == new_y:
-                    crate_at_pos = crate
-                    break
-            
-            if crate_at_pos:
-                # Check if crate can be pushed
-                new_crate_x, new_crate_y = new_x + dx, new_y + dy
-                
-                # Check bounds for crate
-                if (new_crate_y < 0 or new_crate_y >= len(self.grid) or 
-                    new_crate_x < 0 or new_crate_x >= len(self.grid[0])):
-                    continue
-                
-                # Check wall for crate
-                if self.grid[new_crate_y][new_crate_x] == WALL:
-                    continue
-                
-                # Check if another crate is there
-                crate_blocked = False
-                for other_crate in self.crates_pos:
-                    if other_crate[0] == new_crate_x and other_crate[1] == new_crate_y:
-                        crate_blocked = True
-                        break
-                
-                if not crate_blocked:
-                    moves.append((dx, dy))
-            else:
+            if self._is_valid_move(dx, dy):
                 moves.append((dx, dy))
         
         return moves
+    
+    def _is_valid_move(self, dx, dy):
+        """Check if a move is valid"""
+        new_x, new_y = self.player_pos[0] + dx, self.player_pos[1] + dy
+        
+        # Check bounds
+        if not (0 <= new_x < len(self.grid[0]) and 0 <= new_y < len(self.grid)):
+            return False
+        
+        # Check wall
+        if self.grid[new_y][new_x] == WALL:
+            return False
+        
+        # Check if there's a crate
+        crate_at_pos = None
+        for crate in self.crates_pos:
+            if crate[0] == new_x and crate[1] == new_y:
+                crate_at_pos = crate
+                break
+        
+        if crate_at_pos:
+            # Check if crate can be pushed
+            new_crate_x, new_crate_y = new_x + dx, new_y + dy
+            
+            # Check bounds for crate
+            if not (0 <= new_crate_x < len(self.grid[0]) and 0 <= new_crate_y < len(self.grid)):
+                return False
+            
+            # Check wall for crate
+            if self.grid[new_crate_y][new_crate_x] == WALL:
+                return False
+            
+            # Check if another crate is there
+            for other_crate in self.crates_pos:
+                if other_crate[0] == new_crate_x and other_crate[1] == new_crate_y:
+                    return False
+        
+        return True
     
     def apply_move(self, dx, dy):
         """Apply a move and return new state"""
@@ -199,126 +135,53 @@ class GameState:
         
         return new_state
 
-class SimulatedAnnealingSolver:
-    def __init__(self, initial_state, max_iterations=5000, initial_temp=1000, cooling_rate=0.995, max_moves=50):
+class BFSSolver:
+    def __init__(self, initial_state, max_moves=100):
         self.initial_state = initial_state
-        self.max_iterations = max_iterations
-        self.initial_temp = initial_temp
-        self.cooling_rate = cooling_rate
-        self.max_moves = max_moves  # Prevent extremely long solutions
-        self.solution_path = []
-        self.best_solution = None
-        self.best_move_count = float('inf')
+        self.max_moves = max_moves
     
     def solve(self):
-        """Solve using simulated annealing - optimized for shortest path"""
-        current_state = self.initial_state.copy()
-        current_cost = current_state.evaluate()
+        """Solve using BFS to find shortest solution"""
+        queue = deque([(self.initial_state, [])])
+        visited = {self.initial_state.get_hash()}
         
-        best_state = current_state.copy()
-        best_cost = current_cost
+        print("Starting BFS solver...")
         
-        temperature = self.initial_temp
-        path = []
-        
-        print(f"Starting solver with initial cost: {current_cost}")
-        print(f"Looking for solution with minimal moves...")
-        
-        for iteration in range(self.max_iterations):
-            # Check if we found a solution
+        while queue:
+            current_state, path = queue.popleft()
+            
+            # Check if solved
             if current_state.is_solved():
-                move_count = len(path)
-                print(f"Solution found in {iteration} iterations with {move_count} moves!")
-                
-                # Keep track of the best (shortest) solution found
-                if move_count < self.best_move_count:
-                    self.best_move_count = move_count
-                    self.best_solution = path[:]
-                    print(f"New best solution: {move_count} moves!")
-                
-                # Continue searching for better solutions unless we're at max iterations
-                if iteration < self.max_iterations * 0.8:  # Keep searching for 80% of iterations
-                    # Restart from beginning with different random seed
-                    current_state = self.initial_state.copy()
-                    current_cost = current_state.evaluate()
-                    path = []
-                    temperature = self.initial_temp * 0.8  # Slightly lower temperature
-                    continue
-                else:
-                    break
+                print(f"Solution found with {len(path)} moves!")
+                return path
             
-            # Prevent overly long solutions
-            if len(path) > self.max_moves:
-                # Restart with a fresh state
-                current_state = self.initial_state.copy()
-                current_cost = current_state.evaluate()
-                path = []
-                temperature = self.initial_temp * 0.5
+            # Don't explore paths that are too long
+            if len(path) >= self.max_moves:
                 continue
             
-            # Get possible moves
-            possible_moves = current_state.get_possible_moves()
-            if not possible_moves:
-                # Dead end - restart
-                current_state = self.initial_state.copy()
-                current_cost = current_state.evaluate()
-                path = []
-                temperature = self.initial_temp * 0.7
-                continue
-            
-            # Choose a random move
-            move = random.choice(possible_moves)
-            new_state = current_state.apply_move(move[0], move[1])
-            new_cost = new_state.evaluate()
-            
-            # Calculate acceptance probability
-            if new_cost < current_cost:
-                # Better solution, accept it
-                current_state = new_state
-                current_cost = new_cost
-                path.append(move)
+            # Try all possible moves
+            for move in current_state.get_possible_moves():
+                new_state = current_state.apply_move(move[0], move[1])
+                state_hash = new_state.get_hash()
                 
-                if new_cost < best_cost:
-                    best_state = new_state.copy()
-                    best_cost = new_cost
-            else:
-                # Worse solution, accept with probability
-                if temperature > 0:
-                    probability = math.exp(-(new_cost - current_cost) / temperature)
-                    if random.random() < probability:
-                        current_state = new_state
-                        current_cost = new_cost
-                        path.append(move)
-            
-            # Cool down
-            temperature *= self.cooling_rate
-            
-            # Print progress occasionally
-            if iteration % 500 == 0:
-                best_so_far = f", Best: {self.best_move_count} moves" if self.best_solution else ""
-                print(f"Iteration {iteration}, Cost: {current_cost:.2f}, Moves: {len(path)}, Temp: {temperature:.2f}{best_so_far}")
+                if state_hash not in visited:
+                    visited.add(state_hash)
+                    new_path = path + [move]
+                    queue.append((new_state, new_path))
         
-        if self.best_solution:
-            print(f"Solver finished. Best solution: {self.best_move_count} moves")
-            return self.best_solution
-        else:
-            print(f"Solver finished. No solution found.")
-            return None
+        print("No solution found within move limit")
+        return None
 
 class BoxBangGame:
     def __init__(self):
         self.level_num = 1
         self.auto_solve = False
-        self.auto_solve_delay = 0.3  # seconds between auto moves
-        self.last_auto_move_time = 0
         self.solver = None
         self.solution_moves = []
         self.current_move_index = 0
         self.show_level_select = False
         self.available_levels = self.scan_available_levels()
         self.load_level(self.level_num)
-        self.current_level = 0  # Track current level number
-        self.max_levels = len(self.scan_available_levels())  # Get total levels
     
     def scan_available_levels(self):
         """Scan for available level files"""
@@ -335,16 +198,17 @@ class BoxBangGame:
         return levels
     
     def create_default_level(self):
-        """Create a default level if no level files exist"""
-        default_level = """########
-#  .   #
-# $ @  #
-#      #
-########"""
+        """Create a simple default level"""
+        default_level = [
+            "########",
+            "#  .   #",
+            "#  $@  #",
+            "#      #",
+            "########"
+        ]
         
         with open("lvl1.txt", "w") as f:
-            f.write(default_level)
-        print("Created default level: lvl1.txt")
+            f.write('\n'.join(default_level))
     
     def load_level(self, level_num):
         """Load a level from file"""
@@ -375,14 +239,6 @@ class BoxBangGame:
                     elif cell == TARGET:
                         self.targets_pos.append([x, y])
                         grid_row.append(FLOOR)
-                    elif cell == CRATE_ON_TARGET:
-                        self.crates_pos.append([x, y])
-                        self.targets_pos.append([x, y])
-                        grid_row.append(FLOOR)
-                    elif cell == PLAYER_ON_TARGET:
-                        self.player_pos = [x, y]
-                        self.targets_pos.append([x, y])
-                        grid_row.append(FLOOR)
                     else:
                         grid_row.append(cell)
                 self.grid.append(grid_row)
@@ -390,7 +246,6 @@ class BoxBangGame:
             self.level_num = level_num
             self.move_count = 0
             self.moves_history = []
-            self.game_state = GameState(self.grid, self.player_pos, self.crates_pos, self.targets_pos)
             
             # Reset auto-solve state
             self.auto_solve = False
@@ -416,43 +271,7 @@ class BoxBangGame:
     
     def is_valid_move(self, dx, dy):
         """Check if a move is valid"""
-        new_x, new_y = self.player_pos[0] + dx, self.player_pos[1] + dy
-        
-        # Check if position is within grid bounds
-        if (new_y < 0 or new_y >= len(self.grid) or 
-            new_x < 0 or new_x >= len(self.grid[0])):
-            return False
-        
-        # Check if position has a wall
-        if self.grid[new_y][new_x] == WALL:
-            return False
-        
-        # Check if position has a crate
-        crate_idx = -1
-        for i, crate in enumerate(self.crates_pos):
-            if crate[0] == new_x and crate[1] == new_y:
-                crate_idx = i
-                break
-        
-        if crate_idx >= 0:
-            # There is a crate, so check if it can be pushed
-            new_crate_x, new_crate_y = new_x + dx, new_y + dy
-            
-            # Check if new crate position is valid
-            if (new_crate_y < 0 or new_crate_y >= len(self.grid) or 
-                new_crate_x < 0 or new_crate_x >= len(self.grid[0])):
-                return False
-            
-            # Check if new crate position has a wall
-            if self.grid[new_crate_y][new_crate_x] == WALL:
-                return False
-            
-            # Check if new crate position has another crate
-            for crate in self.crates_pos:
-                if crate[0] == new_crate_x and crate[1] == new_crate_y:
-                    return False
-        
-        return True
+        return self.get_current_state()._is_valid_move(dx, dy)
     
     def move_player(self, dx, dy):
         """Move the player and possibly push crates"""
@@ -489,9 +308,6 @@ class BoxBangGame:
         # Check if level is completed
         if self.is_level_completed():
             print(f"Level {self.level_num} completed in {self.move_count} moves!")
-            # Don't auto-advance to next level anymore
-            # self.level_num += 1
-            # self.load_level(self.level_num)
         
         return True
     
@@ -509,25 +325,21 @@ class BoxBangGame:
     
     def is_level_completed(self):
         """Check if all crates are on targets"""
-        for crate in self.crates_pos:
-            if crate not in self.targets_pos:
-                return False
-        return True
+        return all(crate in self.targets_pos for crate in self.crates_pos)
     
     def toggle_auto_solve(self):
         """Toggle automatic solving on/off"""
         if not self.auto_solve:
             # Start auto-solving
-            print("Starting auto-solve with simulated annealing (optimized for shortest path)...")
+            print("Starting auto-solve with BFS...")
             current_state = self.get_current_state()
-            self.solver = SimulatedAnnealingSolver(current_state)
+            self.solver = BFSSolver(current_state)
             self.solution_moves = self.solver.solve()
             
             if self.solution_moves:
                 self.auto_solve = True
                 self.current_move_index = 0
-                print(f"Optimal solution found with {len(self.solution_moves)} moves!")
-                print("Starting animation...")
+                print(f"Solution found with {len(self.solution_moves)} moves!")
             else:
                 print("No solution found!")
         else:
@@ -539,12 +351,6 @@ class BoxBangGame:
         """Perform one step of automatic solving"""
         if not self.auto_solve or not self.solution_moves:
             return False
-        
-        current_time = time.time()
-        if current_time - self.last_auto_move_time < self.auto_solve_delay:
-            return False
-        
-        self.last_auto_move_time = current_time
         
         if self.current_move_index < len(self.solution_moves):
             dx, dy = self.solution_moves[self.current_move_index]
@@ -559,17 +365,17 @@ class BoxBangGame:
     
     def next_level(self):
         """Load next level if available"""
-        if self.current_level < self.max_levels - 1:
-            self.current_level += 1
-            self.load_level(self.current_level)
+        current_index = self.available_levels.index(self.level_num) if self.level_num in self.available_levels else 0
+        if current_index < len(self.available_levels) - 1:
+            self.load_level(self.available_levels[current_index + 1])
             return True
         return False
 
     def previous_level(self):
         """Load previous level if available"""
-        if self.current_level > 0:
-            self.current_level -= 1
-            self.load_level(self.current_level)
+        current_index = self.available_levels.index(self.level_num) if self.level_num in self.available_levels else 0
+        if current_index > 0:
+            self.load_level(self.available_levels[current_index - 1])
             return True
         return False
     
@@ -605,7 +411,6 @@ class BoxBangGame:
         
         # Draw level grid
         cols = 10
-        rows = (len(self.available_levels) + cols - 1) // cols
         start_x = 50
         start_y = 200
         cell_width = 70
@@ -633,18 +438,13 @@ class BoxBangGame:
         # Instructions
         instructions = [
             "Use number keys (1-9, 0) to select levels",
-            "Press Enter to confirm selection",
             "Press Escape to return to game",
-            "Use Page Up/Down to navigate levels",
-            "",
-            f"Total levels available: {len(self.available_levels)}"
+            "Use Page Up/Down to navigate levels"
         ]
         
         for i, instruction in enumerate(instructions):
-            if instruction:  # Skip empty lines
-                color = WHITE if instruction != f"Total levels available: {len(self.available_levels)}" else GREEN
-                text = small_font.render(instruction, True, color)
-                screen.blit(text, (50, 450 + i * 20))
+            text = small_font.render(instruction, True, WHITE)
+            screen.blit(text, (50, 450 + i * 20))
     
     def draw(self):
         """Draw the game state to the screen"""
@@ -714,30 +514,12 @@ class BoxBangGame:
         
         # Auto-solve status
         if self.auto_solve:
-            auto_text = font.render("Auto-solving: ON", True, GREEN)
-            screen.blit(auto_text, (SCREEN_WIDTH - 180, 20))
-            
-            if self.solution_moves:
-                progress_text = font.render(f"Progress: {self.current_move_index}/{len(self.solution_moves)}", True, WHITE)
-                screen.blit(progress_text, (SCREEN_WIDTH - 180, 50))
-        else:
-            auto_text = font.render("Auto-solve: OFF", True, WHITE)
-            screen.blit(auto_text, (SCREEN_WIDTH - 180, 20))
-        
-        # Show solution info
-        if self.solution_moves and not self.auto_solve:
-            solution_text = font.render(f"Solution: {len(self.solution_moves)} moves", True, YELLOW)
-            screen.blit(solution_text, (SCREEN_WIDTH - 180, 50))
+            auto_text = font.render(f"Auto-solving: {self.current_move_index}/{len(self.solution_moves)}", True, GREEN)
+            screen.blit(auto_text, (SCREEN_WIDTH - 200, 20))
         
         # Controls info
-        controls = [
-            "Arrow Keys: Move  |  S: Auto-solve  |  R: Restart  |  Z: Undo",
-            "L: Level Select  |  P/N: Prev/Next Level  |  1-9,0: Quick Level Select"
-        ]
-        
-        for i, control in enumerate(controls):
-            controls_text = small_font.render(control, True, WHITE)
-            screen.blit(controls_text, (20, SCREEN_HEIGHT - 50 + i * 20))
+        controls_text = small_font.render("Arrow Keys: Move | S: Auto-solve | R: Restart | Z: Undo | L: Level Select", True, WHITE)
+        screen.blit(controls_text, (20, SCREEN_HEIGHT - 30))
         
         # Update the display
         pygame.display.flip()
@@ -777,9 +559,9 @@ def main():
                     game.previous_level()
                 elif event.key == pygame.K_PAGEDOWN:
                     game.next_level()
-                elif event.key == pygame.K_n:  # 'N' key for next level
+                elif event.key == pygame.K_n:
                     game.next_level()
-                elif event.key == pygame.K_p:  # 'P' key for previous level
+                elif event.key == pygame.K_p:
                     game.previous_level()
                 # Number keys for quick level select
                 elif event.key in range(pygame.K_0, pygame.K_9 + 1):
