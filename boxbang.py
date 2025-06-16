@@ -27,6 +27,7 @@ GREEN = (0, 255, 0)
 BLUE = (0, 0, 255)
 YELLOW = (255, 255, 0)
 ORANGE = (255, 165, 0)
+PURPLE = (128, 0, 128)
 
 # Game elements
 WALL = '#'
@@ -45,14 +46,15 @@ clock = pygame.time.Clock()
 # Font
 font = pygame.font.SysFont('Arial', 24)
 small_font = pygame.font.SysFont('Arial', 16)
+large_font = pygame.font.SysFont('Arial', 36)
 
 class GameState:
-    def __init__(self, level_grid, player_pos, crates_pos, targets_pos):
+    def __init__(self, level_grid, player_pos, crates_pos, targets_pos, move_count=0):
         self.grid = level_grid
         self.player_pos = player_pos[:]
         self.crates_pos = [crate[:] for crate in crates_pos]
         self.targets_pos = targets_pos[:]
-        self.move_count = 0
+        self.move_count = move_count
         self.moves_history = []
     
     def copy(self):
@@ -60,13 +62,15 @@ class GameState:
             [row[:] for row in self.grid],
             self.player_pos[:],
             [crate[:] for crate in self.crates_pos],
-            self.targets_pos[:]
+            self.targets_pos[:],
+            self.move_count
         )
     
     def evaluate(self):
-        """Evaluation function for simulated annealing"""
+        """Evaluation function for simulated annealing - prioritizes fewer moves"""
         if self.is_solved():
-            return 0
+            # Solved state - return negative move count to prefer fewer moves
+            return -self.move_count
         
         total_distance = 0
         
@@ -82,16 +86,19 @@ class GameState:
         deadlock_penalty = 0
         for crate in self.crates_pos:
             if self._is_deadlock(crate):
-                deadlock_penalty += 100
+                deadlock_penalty += 1000  # Heavy penalty for deadlocks
         
         # Add penalty for crates blocking each other
         blocking_penalty = 0
         for i, crate1 in enumerate(self.crates_pos):
             for j, crate2 in enumerate(self.crates_pos[i+1:], i+1):
                 if abs(crate1[0] - crate2[0]) + abs(crate1[1] - crate2[1]) == 1:
-                    blocking_penalty += 5
+                    blocking_penalty += 10
         
-        return total_distance + deadlock_penalty + blocking_penalty
+        # Penalty for too many moves (encourages shorter solutions)
+        move_penalty = self.move_count * 2
+        
+        return total_distance + deadlock_penalty + blocking_penalty + move_penalty
 
     def _is_deadlock(self, crate):
         """Check if a crate is in a deadlock position"""
@@ -193,15 +200,18 @@ class GameState:
         return new_state
 
 class SimulatedAnnealingSolver:
-    def __init__(self, initial_state, max_iterations=1000, initial_temp=100, cooling_rate=0.95):
+    def __init__(self, initial_state, max_iterations=5000, initial_temp=1000, cooling_rate=0.995, max_moves=50):
         self.initial_state = initial_state
         self.max_iterations = max_iterations
         self.initial_temp = initial_temp
         self.cooling_rate = cooling_rate
+        self.max_moves = max_moves  # Prevent extremely long solutions
         self.solution_path = []
+        self.best_solution = None
+        self.best_move_count = float('inf')
     
     def solve(self):
-        """Solve using simulated annealing"""
+        """Solve using simulated annealing - optimized for shortest path"""
         current_state = self.initial_state.copy()
         current_cost = current_state.evaluate()
         
@@ -212,17 +222,49 @@ class SimulatedAnnealingSolver:
         path = []
         
         print(f"Starting solver with initial cost: {current_cost}")
+        print(f"Looking for solution with minimal moves...")
         
         for iteration in range(self.max_iterations):
+            # Check if we found a solution
             if current_state.is_solved():
-                print(f"Solution found in {iteration} iterations!")
-                self.solution_path = path
-                return path
+                move_count = len(path)
+                print(f"Solution found in {iteration} iterations with {move_count} moves!")
+                
+                # Keep track of the best (shortest) solution found
+                if move_count < self.best_move_count:
+                    self.best_move_count = move_count
+                    self.best_solution = path[:]
+                    print(f"New best solution: {move_count} moves!")
+                
+                # Continue searching for better solutions unless we're at max iterations
+                if iteration < self.max_iterations * 0.8:  # Keep searching for 80% of iterations
+                    # Restart from beginning with different random seed
+                    current_state = self.initial_state.copy()
+                    current_cost = current_state.evaluate()
+                    path = []
+                    temperature = self.initial_temp * 0.8  # Slightly lower temperature
+                    continue
+                else:
+                    break
+            
+            # Prevent overly long solutions
+            if len(path) > self.max_moves:
+                # Restart with a fresh state
+                current_state = self.initial_state.copy()
+                current_cost = current_state.evaluate()
+                path = []
+                temperature = self.initial_temp * 0.5
+                continue
             
             # Get possible moves
             possible_moves = current_state.get_possible_moves()
             if not possible_moves:
-                break
+                # Dead end - restart
+                current_state = self.initial_state.copy()
+                current_cost = current_state.evaluate()
+                path = []
+                temperature = self.initial_temp * 0.7
+                continue
             
             # Choose a random move
             move = random.choice(possible_moves)
@@ -252,67 +294,116 @@ class SimulatedAnnealingSolver:
             temperature *= self.cooling_rate
             
             # Print progress occasionally
-            if iteration % 100 == 0:
-                print(f"Iteration {iteration}, Cost: {current_cost}, Temp: {temperature:.2f}")
+            if iteration % 500 == 0:
+                best_so_far = f", Best: {self.best_move_count} moves" if self.best_solution else ""
+                print(f"Iteration {iteration}, Cost: {current_cost:.2f}, Moves: {len(path)}, Temp: {temperature:.2f}{best_so_far}")
         
-        print(f"Solver finished. Best cost: {best_cost}")
-        return None
+        if self.best_solution:
+            print(f"Solver finished. Best solution: {self.best_move_count} moves")
+            return self.best_solution
+        else:
+            print(f"Solver finished. No solution found.")
+            return None
 
 class BoxBangGame:
     def __init__(self):
         self.level_num = 1
         self.auto_solve = False
-        self.auto_solve_delay = 0.5  # seconds between auto moves
+        self.auto_solve_delay = 0.3  # seconds between auto moves
         self.last_auto_move_time = 0
         self.solver = None
         self.solution_moves = []
         self.current_move_index = 0
+        self.show_level_select = False
+        self.available_levels = self.scan_available_levels()
         self.load_level(self.level_num)
+        self.current_level = 0  # Track current level number
+        self.max_levels = len(self.scan_available_levels())  # Get total levels
+    
+    def scan_available_levels(self):
+        """Scan for available level files"""
+        levels = []
+        for i in range(1, 101):  # Check for levels 1-100
+            if os.path.exists(f"lvl{i}.txt"):
+                levels.append(i)
+        
+        # If no level files found, create a default level
+        if not levels:
+            self.create_default_level()
+            levels = [1]
+        
+        return levels
+    
+    def create_default_level(self):
+        """Create a default level if no level files exist"""
+        default_level = """########
+#  .   #
+# $ @  #
+#      #
+########"""
+        
+        with open("lvl1.txt", "w") as f:
+            f.write(default_level)
+        print("Created default level: lvl1.txt")
     
     def load_level(self, level_num):
-        """Load a level from file or use a default level"""
-
-        with open(f"lvl{level_num}.txt", "r") as f:
-            level_data = f.read().strip().split('\n')
+        """Load a level from file"""
+        filename = f"lvl{level_num}.txt"
         
-        self.grid = []
-        self.player_pos = [0, 0]
-        self.crates_pos = []
-        self.targets_pos = []
+        if not os.path.exists(filename):
+            print(f"Level {level_num} not found!")
+            return False
         
-        for y, row in enumerate(level_data):
-            grid_row = []
-            for x, cell in enumerate(row):
-                if cell == PLAYER:
-                    self.player_pos = [x, y]
-                    grid_row.append(FLOOR)
-                elif cell == CRATE:
-                    self.crates_pos.append([x, y])
-                    grid_row.append(FLOOR)
-                elif cell == TARGET:
-                    self.targets_pos.append([x, y])
-                    grid_row.append(FLOOR)
-                elif cell == CRATE_ON_TARGET:
-                    self.crates_pos.append([x, y])
-                    self.targets_pos.append([x, y])
-                    grid_row.append(FLOOR)
-                elif cell == PLAYER_ON_TARGET:
-                    self.player_pos = [x, y]
-                    self.targets_pos.append([x, y])
-                    grid_row.append(FLOOR)
-                else:
-                    grid_row.append(cell)
-            self.grid.append(grid_row)
-        
-        self.move_count = 0
-        self.moves_history = []
-        self.game_state = GameState(self.grid, self.player_pos, self.crates_pos, self.targets_pos)
-        
-        # Reset auto-solve state
-        self.auto_solve = False
-        self.solver = None
-        self.solution_moves = []
-        self.current_move_index = 0
+        try:
+            with open(filename, "r") as f:
+                level_data = f.read().strip().split('\n')
+            
+            self.grid = []
+            self.player_pos = [0, 0]
+            self.crates_pos = []
+            self.targets_pos = []
+            
+            for y, row in enumerate(level_data):
+                grid_row = []
+                for x, cell in enumerate(row):
+                    if cell == PLAYER:
+                        self.player_pos = [x, y]
+                        grid_row.append(FLOOR)
+                    elif cell == CRATE:
+                        self.crates_pos.append([x, y])
+                        grid_row.append(FLOOR)
+                    elif cell == TARGET:
+                        self.targets_pos.append([x, y])
+                        grid_row.append(FLOOR)
+                    elif cell == CRATE_ON_TARGET:
+                        self.crates_pos.append([x, y])
+                        self.targets_pos.append([x, y])
+                        grid_row.append(FLOOR)
+                    elif cell == PLAYER_ON_TARGET:
+                        self.player_pos = [x, y]
+                        self.targets_pos.append([x, y])
+                        grid_row.append(FLOOR)
+                    else:
+                        grid_row.append(cell)
+                self.grid.append(grid_row)
+            
+            self.level_num = level_num
+            self.move_count = 0
+            self.moves_history = []
+            self.game_state = GameState(self.grid, self.player_pos, self.crates_pos, self.targets_pos)
+            
+            # Reset auto-solve state
+            self.auto_solve = False
+            self.solver = None
+            self.solution_moves = []
+            self.current_move_index = 0
+            
+            print(f"Loaded level {level_num}")
+            return True
+            
+        except Exception as e:
+            print(f"Error loading level {level_num}: {e}")
+            return False
     
     def get_current_state(self):
         """Get current game state"""
@@ -398,8 +489,9 @@ class BoxBangGame:
         # Check if level is completed
         if self.is_level_completed():
             print(f"Level {self.level_num} completed in {self.move_count} moves!")
-            self.level_num += 1
-            self.load_level(self.level_num)
+            # Don't auto-advance to next level anymore
+            # self.level_num += 1
+            # self.load_level(self.level_num)
         
         return True
     
@@ -426,7 +518,7 @@ class BoxBangGame:
         """Toggle automatic solving on/off"""
         if not self.auto_solve:
             # Start auto-solving
-            print("Starting auto-solve with simulated annealing...")
+            print("Starting auto-solve with simulated annealing (optimized for shortest path)...")
             current_state = self.get_current_state()
             self.solver = SimulatedAnnealingSolver(current_state)
             self.solution_moves = self.solver.solve()
@@ -434,7 +526,8 @@ class BoxBangGame:
             if self.solution_moves:
                 self.auto_solve = True
                 self.current_move_index = 0
-                print(f"Solution found with {len(self.solution_moves)} moves!")
+                print(f"Optimal solution found with {len(self.solution_moves)} moves!")
+                print("Starting animation...")
             else:
                 print("No solution found!")
         else:
@@ -464,8 +557,101 @@ class BoxBangGame:
             print("Auto-solve completed!")
             return False
     
+    def next_level(self):
+        """Load next level if available"""
+        if self.current_level < self.max_levels - 1:
+            self.current_level += 1
+            self.load_level(self.current_level)
+            return True
+        return False
+
+    def previous_level(self):
+        """Load previous level if available"""
+        if self.current_level > 0:
+            self.current_level -= 1
+            self.load_level(self.current_level)
+            return True
+        return False
+    
+    def toggle_level_select(self):
+        """Toggle level selection screen"""
+        self.show_level_select = not self.show_level_select
+    
+    def select_level_from_number(self, level_num):
+        """Select a specific level by number"""
+        if level_num in self.available_levels:
+            self.load_level(level_num)
+            self.show_level_select = False
+        else:
+            print(f"Level {level_num} not available!")
+    
+    def draw_level_select(self):
+        """Draw the level selection screen"""
+        screen.fill(BLACK)
+        
+        # Title
+        title_text = large_font.render("Level Selection", True, WHITE)
+        title_rect = title_text.get_rect(center=(SCREEN_WIDTH // 2, 50))
+        screen.blit(title_text, title_rect)
+        
+        # Current level indicator
+        current_text = font.render(f"Current Level: {self.level_num}", True, YELLOW)
+        current_rect = current_text.get_rect(center=(SCREEN_WIDTH // 2, 100))
+        screen.blit(current_text, current_rect)
+        
+        # Available levels
+        levels_text = font.render("Available Levels:", True, WHITE)
+        screen.blit(levels_text, (50, 150))
+        
+        # Draw level grid
+        cols = 10
+        rows = (len(self.available_levels) + cols - 1) // cols
+        start_x = 50
+        start_y = 200
+        cell_width = 70
+        cell_height = 40
+        
+        for i, level in enumerate(self.available_levels):
+            row = i // cols
+            col = i % cols
+            x = start_x + col * cell_width
+            y = start_y + row * cell_height
+            
+            # Highlight current level
+            if level == self.level_num:
+                pygame.draw.rect(screen, YELLOW, (x, y, cell_width - 5, cell_height - 5))
+                text_color = BLACK
+            else:
+                pygame.draw.rect(screen, GRAY, (x, y, cell_width - 5, cell_height - 5))
+                text_color = WHITE
+            
+            # Draw level number
+            level_text = font.render(str(level), True, text_color)
+            text_rect = level_text.get_rect(center=(x + cell_width // 2, y + cell_height // 2))
+            screen.blit(level_text, text_rect)
+        
+        # Instructions
+        instructions = [
+            "Use number keys (1-9, 0) to select levels",
+            "Press Enter to confirm selection",
+            "Press Escape to return to game",
+            "Use Page Up/Down to navigate levels",
+            "",
+            f"Total levels available: {len(self.available_levels)}"
+        ]
+        
+        for i, instruction in enumerate(instructions):
+            if instruction:  # Skip empty lines
+                color = WHITE if instruction != f"Total levels available: {len(self.available_levels)}" else GREEN
+                text = small_font.render(instruction, True, color)
+                screen.blit(text, (50, 450 + i * 20))
+    
     def draw(self):
         """Draw the game state to the screen"""
+        if self.show_level_select:
+            self.draw_level_select()
+            return
+        
         # Clear the screen
         screen.fill(BLACK)
         
@@ -521,17 +707,37 @@ class BoxBangGame:
         move_text = font.render(f"Moves: {self.move_count}", True, WHITE)
         screen.blit(move_text, (20, 50))
         
-        # Auto-solve status
-        auto_text = font.render(f"Auto-solve: {'ON' if self.auto_solve else 'OFF'}", True, WHITE)
-        screen.blit(auto_text, (SCREEN_WIDTH - 180, 20))
+        # Level completion status
+        if self.is_level_completed():
+            completed_text = font.render("LEVEL COMPLETED!", True, GREEN)
+            screen.blit(completed_text, (20, 80))
         
-        if self.auto_solve and self.solution_moves:
-            progress_text = font.render(f"Progress: {self.current_move_index}/{len(self.solution_moves)}", True, WHITE)
-            screen.blit(progress_text, (SCREEN_WIDTH - 180, 50))
+        # Auto-solve status
+        if self.auto_solve:
+            auto_text = font.render("Auto-solving: ON", True, GREEN)
+            screen.blit(auto_text, (SCREEN_WIDTH - 180, 20))
+            
+            if self.solution_moves:
+                progress_text = font.render(f"Progress: {self.current_move_index}/{len(self.solution_moves)}", True, WHITE)
+                screen.blit(progress_text, (SCREEN_WIDTH - 180, 50))
+        else:
+            auto_text = font.render("Auto-solve: OFF", True, WHITE)
+            screen.blit(auto_text, (SCREEN_WIDTH - 180, 20))
+        
+        # Show solution info
+        if self.solution_moves and not self.auto_solve:
+            solution_text = font.render(f"Solution: {len(self.solution_moves)} moves", True, YELLOW)
+            screen.blit(solution_text, (SCREEN_WIDTH - 180, 50))
         
         # Controls info
-        controls_text = small_font.render("Arrow Keys: Move, S: Auto-solve, R: Restart, Z: Undo", True, WHITE)
-        screen.blit(controls_text, (20, SCREEN_HEIGHT - 30))
+        controls = [
+            "Arrow Keys: Move  |  S: Auto-solve  |  R: Restart  |  Z: Undo",
+            "L: Level Select  |  P/N: Prev/Next Level  |  1-9,0: Quick Level Select"
+        ]
+        
+        for i, control in enumerate(controls):
+            controls_text = small_font.render(control, True, WHITE)
+            screen.blit(controls_text, (20, SCREEN_HEIGHT - 50 + i * 20))
         
         # Update the display
         pygame.display.flip()
@@ -545,33 +751,51 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_UP:
-                    game.move_player(0, -1)
-                elif event.key == pygame.K_RIGHT:
-                    game.move_player(1, 0)
-                elif event.key == pygame.K_DOWN:
-                    game.move_player(0, 1)
+                if event.key == pygame.K_ESCAPE:
+                    if game.show_level_select:
+                        game.show_level_select = False
+                    else:
+                        running = False
                 elif event.key == pygame.K_LEFT:
                     game.move_player(-1, 0)
-                elif event.key == pygame.K_r:  # Restart level
+                elif event.key == pygame.K_RIGHT:
+                    game.move_player(1, 0)
+                elif event.key == pygame.K_UP:
+                    game.move_player(0, -1)
+                elif event.key == pygame.K_DOWN:
+                    game.move_player(0, 1)
+                elif event.key == pygame.K_r:
                     game.load_level(game.level_num)
-                elif event.key == pygame.K_z:  # Undo
-                    game.undo_move()
-                elif event.key == pygame.K_s:  # Toggle auto-solve
+                elif event.key == pygame.K_s:
                     game.toggle_auto_solve()
-        
-        # Auto-solve step if enabled
+                elif event.key == pygame.K_z:
+                    game.undo_move()
+                elif event.key == pygame.K_l:
+                    game.toggle_level_select()
+                elif event.key == pygame.K_PAGEUP:
+                    game.previous_level()
+                elif event.key == pygame.K_PAGEDOWN:
+                    game.next_level()
+                elif event.key == pygame.K_n:  # 'N' key for next level
+                    game.next_level()
+                elif event.key == pygame.K_p:  # 'P' key for previous level
+                    game.previous_level()
+                # Number keys for quick level select
+                elif event.key in range(pygame.K_0, pygame.K_9 + 1):
+                    level = event.key - pygame.K_0 if event.key != pygame.K_0 else 10
+                    game.select_level_from_number(level)
+
+        # Update game state
         if game.auto_solve:
             game.auto_solve_step()
-        
-        # Draw the game
+
+        # Draw everything
         game.draw()
         
-        # Cap the frame rate
+        # Control game speed
         clock.tick(FPS)
-    
+
     pygame.quit()
     sys.exit()
 
